@@ -1,11 +1,12 @@
-"""smash-cli: run Kentskooking's MiniMax H3 "context smashing" workflow on a RunPod GPU.
+"""smash-cli: run Kentskooking's MiniMax H3 context smashing workflows on a RunPod GPU.
 
-Commands: up, status, run, down. See README.md.
+Commands: up, status, canvas, blend, down. See README.md.
 """
 
 import argparse
 import base64
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -18,36 +19,49 @@ from pathlib import Path
 import requests
 
 ROOT = Path(__file__).resolve().parent
-WORKFLOW = ROOT / "vendor/kentskooking/MiniMax_H3_Concentric_RedGreen_Canvas_8step.json"
-DEFAULT_MASK = ROOT / "vendor/kentskooking/Concentric_Center_Circle_RedGreen_150f.mp4"
+VENDOR = ROOT / "vendor/kentskooking"
+CANVAS_WORKFLOW = VENDOR / "MiniMax_H3_Concentric_RedGreen_Canvas_8step.json"
+BLEND_WORKFLOW = VENDOR / "MiniMax_H3_Omni_Video_Blend_NVFP4_8step.json"
+DEFAULT_MASK = VENDOR / "Concentric_Center_Circle_RedGreen_150f.mp4"
 BOOT = ROOT / "pod/boot.sh"
 STATE = Path.home() / ".smash-cli/pod.json"
 
 RUNPOD_API = "https://rest.runpod.io/v1"
 IMAGE = "runpod/pytorch:1.6.0-cu1281-torch2130-ubuntu2404"
-# 96 GB Blackwell cards: the workflow's text encoder is NVFP4 (Blackwell only).
+# 96 GB Blackwell cards: the workflows' NVFP4 weights need Blackwell.
 GPUS = [
     "NVIDIA RTX PRO 6000 Blackwell Server Edition",
     "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
 ]
 FPS = 24
-
-# Node ids in Kent's workflow (vendor/kentskooking/…Canvas_8step.json).
-N_RED_PROMPT, N_GREEN_PROMPT, N_CANVAS_PROMPT = "4", "216", "212"
-N_LENGTH, N_WIDTH, N_HEIGHT = "5", "200", "201"
-N_SEED, N_MASK_VIDEO, N_CANVAS_STRENGTH = "15", "51", "214"
-N_RED_IMAGE, N_GREEN_IMAGE, N_CANVAS_IMAGE = "110", "140", "211"
-N_SIGMA_SHIFT = "8"
-# Optional speed/preview patches (SageAttention, tiny-VAE preview). Kent's
-# example README says to bypass both by wiring Sigma Shift straight through.
-BYPASS_TO_SIGMA_SHIFT = {"9", "10"}
-# "Hold last mask frame" node from comfyui_essentials; we pad the mask with
-# ffmpeg instead, so the loader feeds the guider directly.
-N_MASK_EXPAND = "209"
-# Kent's CreateVideo/SaveVideo widgets differ between ComfyUI versions; we save
-# the decoded video (20) and audio (21) with VideoHelperSuite instead.
-N_VIDEO_DECODE, N_AUDIO_DECODE, OUTPUT_NODES = "20", "21", {"22", "23"}
 SKIP_TYPES = {"MarkdownNote", "Note"}
+
+# Node ids shared by both of Kent's workflows.
+N_LENGTH, N_SEED, N_SIGMA_SHIFT = "5", "15", "8"
+N_VIDEO_DECODE, N_AUDIO_DECODE = "20", "21"
+# Every run changes Kent's graphs in the same way:
+# - 9, 10: optional SageAttention and tiny-VAE preview patches; his example
+#   README says to bypass both by wiring Sigma Shift straight through.
+# - 22, 23: CreateVideo/SaveVideo widgets differ between ComfyUI versions;
+#   we save decoded video (20) and audio (21) with VideoHelperSuite instead.
+# - comfyui_essentials "hold last frame" nodes: we pad clips with ffmpeg, so
+#   the loaders feed their consumers directly.
+COMMON_REROUTE = {"9": (N_SIGMA_SHIFT, 0), "10": (N_SIGMA_SHIFT, 0)}
+COMMON_DROP = {"22", "23"}
+
+# Canvas (MiniMax_H3_Concentric_RedGreen_Canvas_8step.json): 3 images + mask.
+C_RED_PROMPT, C_GREEN_PROMPT, C_CANVAS_PROMPT = "4", "216", "212"
+C_WIDTH, C_HEIGHT, C_MASK_VIDEO, C_CANVAS_STRENGTH = "200", "201", "51", "214"
+C_RED_IMAGE, C_GREEN_IMAGE, C_CANVAS_IMAGE = "110", "140", "211"
+C_REROUTE = {**COMMON_REROUTE, "209": (C_MASK_VIDEO, 0)}
+
+# Blend (MiniMax_H3_Omni_Video_Blend_NVFP4_8step.json): 2 videos.
+B_A_PROMPT, B_B_PROMPT, B_A_VIDEO, B_B_VIDEO = "4", "42", "60", "61"
+B_OUT_W, B_OUT_H, B_REF_W, B_REF_H = "100", "101", "102", "103"
+B_REF_SIZE = 768
+# 65 is a PreviewAny debug display of the token mix; not needed headless.
+B_REROUTE = {**COMMON_REROUTE, "62": (B_A_VIDEO, 0), "63": (B_B_VIDEO, 0)}
+B_DROP = COMMON_DROP | {"65"}
 
 
 def die(msg):
@@ -95,7 +109,7 @@ def cmd_up(a):
         "gpuTypePriority": "custom",
         "cloudType": a.cloud,
         "gpuCount": 1,
-        "containerDiskInGb": 120,
+        "containerDiskInGb": 140,
         "ports": ["8188/http"],
         "env": {"SMASH_BOOT": boot, "SMASH_IDLE_MINUTES": str(a.idle_minutes)},
         "dockerStartCmd": ["bash", "-c", 'echo "$SMASH_BOOT" | base64 -d > /boot.sh && bash /boot.sh'],
@@ -108,7 +122,7 @@ def cmd_up(a):
     gpu = (pod.get("machine") or {}).get("gpuTypeId")
     print(f"pod {pod['id']} on {gpu} ({a.cloud}), ${pod.get('costPerHr')}/h")
     print(f"auto-delete after {a.idle_minutes} idle minutes; `smash-cli down` deletes it now")
-    print("installing ComfyUI and downloading ~42 GB of weights; waiting for ComfyUI …")
+    print("installing ComfyUI and downloading ~57 GB of weights; waiting for ComfyUI …")
     url = base_url(pod["id"])
     start = time.time()
     while True:
@@ -152,32 +166,41 @@ def run(*args):
         die(f"{args[0]} failed: {p.stderr.strip()[-1500:]}")
 
 
-def fetch_source(src, work, name, at, cookies=None):
-    """Local file and seek time for a path, a URL (yt-dlp), or `gen:<prompt>` (fal image)."""
+def image_source(src, work, name):
+    """Local image for a path or `gen:<prompt>` (fal image)."""
     if src.startswith("gen:"):
-        return fal_image(src[4:], work / f"{name}-gen"), 0
+        return fal_image(src[4:], work / f"{name}-gen")
     if src.startswith(("http://", "https://")):
-        # Only the few seconds around the frame we need, not the whole video.
-        out = work / f"{name}-dl"
-        auth = ["--cookies", str(Path(cookies).expanduser())] if cookies else []
-        p = subprocess.run(
-            ["yt-dlp", "-q", "--no-warnings", "--no-playlist", *auth, "-f", "bv*[height<=1080]/b",
-             "--download-sections", f"*{at}-{at + 2}", "-o", f"{out}.%(ext)s", src],
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
-        )
-        files = list(work.glob(f"{name}-dl.*"))
-        if p.returncode != 0 or len(files) != 1:
-            reason = p.stderr.strip().splitlines()[-1] if p.stderr.strip() else f"{len(files)} files written"
-            die(
-                f"could not download --{name} {src}\n  yt-dlp: {reason}\n"
-                "  Fix: download the video yourself (browser or `yt-dlp <url>`) and pass the file path,\n"
-                "  or export YouTube cookies to cookies.txt and add --cookies cookies.txt."
-            )
-        return files[0], 0
+        die(f"--{name} must be an image file or gen:<prompt>; video links go to `smash-cli blend`")
     path = Path(src).expanduser()
     if not path.exists():
         die(f"no such file: {src}")
-    return path, at
+    return path
+
+
+def video_source(src, work, name, start, seconds, cookies=None):
+    """Local video and seek time for a path or a URL (yt-dlp, only the needed section)."""
+    if not src.startswith(("http://", "https://")):
+        path = Path(src).expanduser()
+        if not path.exists():
+            die(f"no such file: {src}")
+        return path, start
+    out = work / f"{name}-dl"
+    auth = ["--cookies", str(Path(cookies).expanduser())] if cookies else []
+    p = subprocess.run(
+        ["yt-dlp", "-q", "--no-warnings", "--no-playlist", *auth, "-f", "bv*[height<=1080]/b",
+         "--download-sections", f"*{start}-{start + seconds}", "-o", f"{out}.%(ext)s", src],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+    )
+    files = list(work.glob(f"{name}-dl.*"))
+    if p.returncode != 0 or len(files) != 1:
+        reason = p.stderr.strip().splitlines()[-1] if p.stderr.strip() else f"{len(files)} files written"
+        die(
+            f"could not download --{name} {src}\n  yt-dlp: {reason}\n"
+            "  Fix: download the video yourself (browser or `yt-dlp <url>`) and pass the file path,\n"
+            "  or export YouTube cookies to cookies.txt and add --cookies cookies.txt."
+        )
+    return files[0], 0
 
 
 def fal_image(prompt, out):
@@ -197,28 +220,24 @@ def fal_image(prompt, out):
     return path
 
 
-def is_video(path):
-    p = subprocess.run(
-        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=nb_frames,duration",
-         "-of", "json", str(path)], capture_output=True, text=True, check=True,
-    )
-    s = (json.loads(p.stdout).get("streams") or [{}])[0]
-    return float(s.get("duration") or 0) > 0.1
+SQUARE = "crop='min(iw,ih)':'min(iw,ih)'"
 
 
-def square_frame(src, out, size, at):
-    """One center-cropped size x size PNG from an image or a video frame at `at` s."""
-    crop = f"crop='min(iw,ih)':'min(iw,ih)',scale={size}:{size}"
-    seek = ["-ss", str(at)] if is_video(src) else []
-    run("ffmpeg", "-y", "-v", "error", *seek, "-i", str(src), "-frames:v", "1", "-vf", crop, str(out))
+def square_image(src, out, size):
+    """Center-cropped size x size PNG."""
+    run("ffmpeg", "-y", "-v", "error", "-i", str(src), "-frames:v", "1",
+        "-vf", f"{SQUARE},scale={size}:{size}", str(out))
     return out
 
 
-def fit_mask(src, out, size, frames):
-    """Mask video at size x size, FPS, exactly `frames` frames (last frame held)."""
-    vf = f"fps={FPS},scale={size}:{size}:flags=neighbor,tpad=stop_mode=clone:stop={frames}"
-    run("ffmpeg", "-y", "-v", "error", "-i", str(src), "-vf", vf, "-frames:v", str(frames),
-        "-c:v", "libx264", "-crf", "0", "-pix_fmt", "yuv444p", str(out))
+def square_clip(src, out, size, frames, start=0, mask=False):
+    """size x size clip at FPS with exactly `frames` frames (last frame held if short)."""
+    scale = f"scale={size}:{size}" + (":flags=neighbor" if mask else "")
+    crop = "" if mask else f"{SQUARE},"
+    vf = f"fps={FPS},{crop}{scale},tpad=stop_mode=clone:stop={frames}"
+    seek = ["-ss", str(start)] if start else []
+    run("ffmpeg", "-y", "-v", "error", *seek, "-i", str(src), "-an", "-vf", vf, "-frames:v", str(frames),
+        "-c:v", "libx264", "-crf", "0" if mask else "12", "-pix_fmt", "yuv444p" if mask else "yuv420p", str(out))
     return out
 
 
@@ -244,12 +263,10 @@ def widget_slots(info):
     return slots
 
 
-def to_api(ui, object_info):
-    """Convert Kent's UI-format workflow to ComfyUI's API (prompt) format."""
+def to_api(ui, object_info, reroute, drop):
+    """Convert one of Kent's UI-format workflows to ComfyUI's API (prompt) format."""
     links = {l[0]: l for l in ui["links"]}
-    dropped = BYPASS_TO_SIGMA_SHIFT | {N_MASK_EXPAND} | OUTPUT_NODES
-    reroute = {n: (N_SIGMA_SHIFT, 0) for n in BYPASS_TO_SIGMA_SHIFT}
-    reroute[N_MASK_EXPAND] = (N_MASK_VIDEO, 0)
+    dropped = set(reroute) | drop
     api = {}
     for node in ui["nodes"]:
         nid = str(node["id"])
@@ -283,9 +300,6 @@ def to_api(ui, object_info):
     return api
 
 
-# ---------------------------------------------------------------- run
-
-
 def comfy(url, method, path, **kw):
     r = requests.request(method, url + path, timeout=300, **kw)
     if r.status_code >= 400:
@@ -299,39 +313,10 @@ def upload(url, path, name):
     return name
 
 
-def cmd_run(a):
-    url = base_url(load_state()["id"])
-    tag = uuid.uuid4().hex[:8]
-    with tempfile.TemporaryDirectory() as tmp:
-        work = Path(tmp)
-        names = {}
-        for role in ("canvas", "red", "green"):
-            src, seek = fetch_source(getattr(a, role), work, role, a.frame_at, a.cookies)
-            png = square_frame(src, work / f"{role}.png", a.size, seek)
-            names[role] = upload(url, png, f"smash-{tag}-{role}.png")
-            print(f"{role}: {getattr(a, role)}")
-        mask = fit_mask(Path(a.mask).expanduser(), work / "mask.mp4", a.size, a.frames)
-        mask_name = upload(url, mask, f"smash-{tag}-mask.mp4")
-        object_info = comfy(url, "GET", "/object_info").json()
-        api = to_api(json.loads(WORKFLOW.read_text()), object_info)
-
-    api[N_CANVAS_IMAGE]["inputs"]["image"] = names["canvas"]
-    api[N_RED_IMAGE]["inputs"]["image"] = names["red"]
-    api[N_GREEN_IMAGE]["inputs"]["image"] = names["green"]
-    for nid, text in ((N_CANVAS_PROMPT, a.canvas_prompt), (N_RED_PROMPT, a.red_prompt), (N_GREEN_PROMPT, a.green_prompt)):
-        if text:
-            api[nid]["inputs"]["value"] = text
-    api[N_MASK_VIDEO]["inputs"].update(video=mask_name, custom_width=a.size, custom_height=a.size,
-                                       force_rate=FPS, frame_load_cap=a.frames)
-    api[N_WIDTH]["inputs"]["value"] = a.size
-    api[N_HEIGHT]["inputs"]["value"] = a.size
-    api[N_LENGTH]["inputs"]["value"] = a.frames
-    api[N_CANVAS_STRENGTH]["inputs"]["strength"] = a.canvas_strength
-    if a.seed is not None:
-        api[N_SEED]["inputs"]["noise_seed"] = a.seed
-
+def generate(url, api, out, what):
+    """Queue the prompt, wait, and download the one MP4 it writes."""
     prompt_id = comfy(url, "POST", "/prompt", json={"prompt": api}).json()["prompt_id"]
-    print(f"queued {prompt_id}; generating {a.frames} frames at {a.size}x{a.size} …")
+    print(f"queued {prompt_id}; generating {what} …")
     start = time.time()
     while True:
         hist = comfy(url, "GET", f"/history/{prompt_id}").json().get(prompt_id)
@@ -341,14 +326,82 @@ def cmd_run(a):
             msgs = [m for m in hist["status"].get("messages", []) if m[0] == "execution_error"]
             die(f"generation failed: {json.dumps(msgs)[:2000]}")
         time.sleep(10)
-    files = [f for out in hist["outputs"].values() for v in out.values() if isinstance(v, list)
+    files = [f for o in hist["outputs"].values() for v in o.values() if isinstance(v, list)
              for f in v if isinstance(f, dict) and str(f.get("filename", "")).endswith(".mp4")]
     if len(files) != 1:
         die(f"expected one mp4 output, got {files}")
     f = files[0]
     video = comfy(url, "GET", "/view", params={"filename": f["filename"], "subfolder": f["subfolder"], "type": f["type"]})
-    Path(a.out).write_bytes(video.content)
-    print(f"done in {(time.time() - start) / 60:.1f} min → {a.out}")
+    Path(out).write_bytes(video.content)
+    print(f"done in {(time.time() - start) / 60:.1f} min → {out}")
+
+
+def set_seed(api, seed):
+    if seed is not None:
+        api[N_SEED]["inputs"]["noise_seed"] = seed
+
+
+# ---------------------------------------------------------------- commands
+
+
+def cmd_canvas(a):
+    url = base_url(load_state()["id"])
+    tag = uuid.uuid4().hex[:8]
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        names = {}
+        for role in ("canvas", "red", "green"):
+            png = square_image(image_source(getattr(a, role), work, role), work / f"{role}.png", a.size)
+            names[role] = upload(url, png, f"smash-{tag}-{role}.png")
+            print(f"{role}: {getattr(a, role)}")
+        mask = square_clip(Path(a.mask).expanduser(), work / "mask.mp4", a.size, a.frames, mask=True)
+        mask_name = upload(url, mask, f"smash-{tag}-mask.mp4")
+    object_info = comfy(url, "GET", "/object_info").json()
+    api = to_api(json.loads(CANVAS_WORKFLOW.read_text()), object_info, C_REROUTE, COMMON_DROP)
+
+    api[C_CANVAS_IMAGE]["inputs"]["image"] = names["canvas"]
+    api[C_RED_IMAGE]["inputs"]["image"] = names["red"]
+    api[C_GREEN_IMAGE]["inputs"]["image"] = names["green"]
+    for nid, text in ((C_CANVAS_PROMPT, a.canvas_prompt), (C_RED_PROMPT, a.red_prompt), (C_GREEN_PROMPT, a.green_prompt)):
+        if text:
+            api[nid]["inputs"]["value"] = text
+    api[C_MASK_VIDEO]["inputs"].update(video=mask_name, custom_width=a.size, custom_height=a.size,
+                                       force_rate=FPS, frame_load_cap=a.frames)
+    api[C_WIDTH]["inputs"]["value"] = a.size
+    api[C_HEIGHT]["inputs"]["value"] = a.size
+    api[N_LENGTH]["inputs"]["value"] = a.frames
+    api[C_CANVAS_STRENGTH]["inputs"]["strength"] = a.canvas_strength
+    set_seed(api, a.seed)
+    generate(url, api, a.out, f"{a.frames} frames at {a.size}x{a.size}")
+
+
+def cmd_blend(a):
+    url = base_url(load_state()["id"])
+    tag = uuid.uuid4().hex[:8]
+    seconds = math.ceil(a.frames / FPS) + 1
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        names = {}
+        for role, start in (("a", a.a_start), ("b", a.b_start)):
+            src, seek = video_source(getattr(a, role), work, role, start, seconds, a.cookies)
+            clip = square_clip(src, work / f"{role}.mp4", B_REF_SIZE, a.frames, start=seek)
+            names[role] = upload(url, clip, f"smash-{tag}-{role}.mp4")
+            print(f"{role}: {getattr(a, role)} from {start}s")
+    object_info = comfy(url, "GET", "/object_info").json()
+    api = to_api(json.loads(BLEND_WORKFLOW.read_text()), object_info, B_REROUTE, B_DROP)
+
+    api[B_A_VIDEO]["inputs"]["video"] = names["a"]
+    api[B_B_VIDEO]["inputs"]["video"] = names["b"]
+    for nid, text in ((B_A_PROMPT, a.a_prompt), (B_B_PROMPT, a.b_prompt)):
+        if text:
+            api[nid]["inputs"]["value"] = text
+    api[B_OUT_W]["inputs"]["value"] = a.size
+    api[B_OUT_H]["inputs"]["value"] = a.size
+    api[B_REF_W]["inputs"]["value"] = B_REF_SIZE
+    api[B_REF_H]["inputs"]["value"] = B_REF_SIZE
+    api[N_LENGTH]["inputs"]["value"] = a.frames
+    set_seed(api, a.seed)
+    generate(url, api, a.out, f"{a.frames} frames at {a.size}x{a.size}")
 
 
 def main():
@@ -368,23 +421,36 @@ def main():
     sub.add_parser("status", help="pod state and cost so far").set_defaults(fn=cmd_status)
     sub.add_parser("down", help="delete the pod").set_defaults(fn=cmd_down)
 
-    r = sub.add_parser("run", help="generate one video",
-                       description="Each source is an image or video file, a URL (yt-dlp), or gen:<prompt> (fal image).")
-    r.add_argument("--canvas", required=True, help="global background source")
-    r.add_argument("--red", required=True, help="source for the red mask region")
-    r.add_argument("--green", required=True, help="source for the green mask region")
-    r.add_argument("--canvas-prompt")
-    r.add_argument("--red-prompt")
-    r.add_argument("--green-prompt")
-    r.add_argument("--mask", default=str(DEFAULT_MASK), help="red/green mask video (default: Kent's concentric circle)")
-    r.add_argument("--frame-at", type=float, default=1.0, help="seconds into video sources to take the frame")
-    r.add_argument("--cookies", help="cookies.txt for yt-dlp when YouTube asks to sign in")
-    r.add_argument("--size", type=int, default=512)
-    r.add_argument("--frames", type=int, default=158)
-    r.add_argument("--canvas-strength", type=float, default=0.65)
-    r.add_argument("--seed", type=int)
-    r.add_argument("--out", default="smash.mp4")
-    r.set_defaults(fn=cmd_run)
+    c = sub.add_parser("canvas", help="3 images + red/green mask -> 1 video (Kent's concentric canvas)",
+                       description="Each source is an image file or gen:<prompt> (image made on fal).")
+    c.add_argument("--canvas", required=True, help="global background image")
+    c.add_argument("--red", required=True, help="image for the red mask region")
+    c.add_argument("--green", required=True, help="image for the green mask region")
+    c.add_argument("--canvas-prompt")
+    c.add_argument("--red-prompt")
+    c.add_argument("--green-prompt")
+    c.add_argument("--mask", default=str(DEFAULT_MASK), help="red/green mask video (default: Kent's concentric circle)")
+    c.add_argument("--size", type=int, default=512)
+    c.add_argument("--frames", type=int, default=158)
+    c.add_argument("--canvas-strength", type=float, default=0.65)
+    c.add_argument("--seed", type=int)
+    c.add_argument("--out", default="smash-canvas.mp4")
+    c.set_defaults(fn=cmd_canvas)
+
+    b = sub.add_parser("blend", help="2 videos -> 1 video (Kent's Omni video blend; no spatial mask)",
+                       description="Each source is a video file or a URL (downloaded locally with yt-dlp).")
+    b.add_argument("--a", required=True, help="first reference video")
+    b.add_argument("--b", required=True, help="second reference video")
+    b.add_argument("--a-start", type=float, default=0, help="start time in seconds")
+    b.add_argument("--b-start", type=float, default=0, help="start time in seconds")
+    b.add_argument("--a-prompt", help="describe clip A and the wanted output (Kent's default refers to <Video 1>)")
+    b.add_argument("--b-prompt")
+    b.add_argument("--cookies", help="cookies.txt for yt-dlp when YouTube asks to sign in")
+    b.add_argument("--size", type=int, default=1024)
+    b.add_argument("--frames", type=int, default=124)
+    b.add_argument("--seed", type=int)
+    b.add_argument("--out", default="smash-blend.mp4")
+    b.set_defaults(fn=cmd_blend)
 
     a = p.parse_args()
     a.fn(a)
