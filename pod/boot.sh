@@ -10,6 +10,7 @@ set -euo pipefail
 COMFYUI_SHA=0decb39ee5b5e17c200334589fc317dbbe98310e
 KENT_SHA=14cc4824d965f7c900b427b4d2d0241c8e7df58c
 VHS_SHA=4d907bee61e92c2e65af3bd6383a4e4d356126d1
+KJ_SHA=ab72eda7ffad6280422d71ab7d54d3fb87c0ba18
 
 clone() { # url dir sha
   git clone -q "$1" "$2"
@@ -42,10 +43,12 @@ cd /root
 clone https://github.com/comfyanonymous/ComfyUI.git ComfyUI "$COMFYUI_SHA"
 clone https://github.com/Kentskooking/ComfyUI-MiniMaxH3-Experiment.git ComfyUI/custom_nodes/ComfyUI-MiniMaxH3-Experiments "$KENT_SHA"
 clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git ComfyUI/custom_nodes/ComfyUI-VideoHelperSuite "$VHS_SHA"
+clone https://github.com/kijai/ComfyUI-KJNodes.git ComfyUI/custom_nodes/ComfyUI-KJNodes "$KJ_SHA"
 
 pip install -q --no-cache-dir -r ComfyUI/requirements.txt
 pip install -q --no-cache-dir -r ComfyUI/custom_nodes/ComfyUI-MiniMaxH3-Experiments/requirements.txt
 pip install -q --no-cache-dir -r ComfyUI/custom_nodes/ComfyUI-VideoHelperSuite/requirements.txt
+pip install -q --no-cache-dir -r ComfyUI/custom_nodes/ComfyUI-KJNodes/requirements.txt
 pip install -q --no-cache-dir "huggingface_hub[hf_xet]>=0.34"
 
 # Official ComfyUI repackage of MiniMax H3; folder layout matches ComfyUI/models.

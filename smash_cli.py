@@ -44,6 +44,9 @@ BYPASS_TO_SIGMA_SHIFT = {"9", "10"}
 # "Hold last mask frame" node from comfyui_essentials; we pad the mask with
 # ffmpeg instead, so the loader feeds the guider directly.
 N_MASK_EXPAND = "209"
+# Kent's CreateVideo/SaveVideo widgets differ between ComfyUI versions; we save
+# the decoded video (20) and audio (21) with VideoHelperSuite instead.
+N_VIDEO_DECODE, N_AUDIO_DECODE, OUTPUT_NODES = "20", "21", {"22", "23"}
 SKIP_TYPES = {"MarkdownNote", "Note"}
 
 
@@ -236,7 +239,7 @@ def widget_slots(info):
 def to_api(ui, object_info):
     """Convert Kent's UI-format workflow to ComfyUI's API (prompt) format."""
     links = {l[0]: l for l in ui["links"]}
-    dropped = BYPASS_TO_SIGMA_SHIFT | {N_MASK_EXPAND}
+    dropped = BYPASS_TO_SIGMA_SHIFT | {N_MASK_EXPAND} | OUTPUT_NODES
     reroute = {n: (N_SIGMA_SHIFT, 0) for n in BYPASS_TO_SIGMA_SHIFT}
     reroute[N_MASK_EXPAND] = (N_MASK_VIDEO, 0)
     api = {}
@@ -264,6 +267,11 @@ def to_api(ui, object_info):
             src, slot = reroute.get(str(src), (str(src), slot))
             inputs[inp["name"]] = [src, slot]
         api[nid] = {"class_type": node["type"], "inputs": inputs}
+    api["smash_out"] = {"class_type": "VHS_VideoCombine", "inputs": {
+        "images": [N_VIDEO_DECODE, 0], "audio": [N_AUDIO_DECODE, 0], "frame_rate": FPS,
+        "loop_count": 0, "filename_prefix": "smash", "format": "video/h264-mp4",
+        "pingpong": False, "save_output": True,
+    }}
     return api
 
 

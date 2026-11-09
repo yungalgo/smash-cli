@@ -18,7 +18,7 @@ This repo only adds the plumbing: pod lifecycle, input preparation, and workflow
 
 ## How it works
 
-1. `up` creates a pod with an RTX PRO 6000 Blackwell (96 GB) GPU. The H3 text encoder is NVFP4, so the GPU must be Blackwell. `pod/boot.sh` installs pinned ComfyUI, Kent's nodes, and VideoHelperSuite, downloads about 42 GB of weights, and starts ComfyUI.
+1. `up` creates a pod with an RTX PRO 6000 Blackwell (96 GB) GPU. The H3 text encoder is NVFP4, so the GPU must be Blackwell. `pod/boot.sh` installs pinned ComfyUI, Kent's nodes, VideoHelperSuite, and KJNodes, downloads about 42 GB of weights, and starts ComfyUI.
 2. `run` prepares three sources. Each one becomes a square frame:
    - **canvas:** the global background
    - **red:** the red mask region
@@ -29,9 +29,10 @@ This repo only adds the plumbing: pod lifecycle, input preparation, and workflow
 
 Each region is an H3 image-to-video branch. Kent's masked conditioning guider mixes the branches inside one generation, so the regions blend in the model. They are not composited afterwards.
 
-Two changes from Kent's file (the same in every run):
+Three changes from Kent's file (the same in every run):
 - The optional SageAttention and tiny-VAE preview patches are bypassed, as his example README describes.
 - The `comfyui_essentials` "hold last frame" node is replaced by ffmpeg padding of the mask.
+- The video is saved with VideoHelperSuite instead of `CreateVideo`/`SaveVideo`, because their widgets change between ComfyUI versions.
 
 ## Setup
 
