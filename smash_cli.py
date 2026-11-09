@@ -160,11 +160,19 @@ def fetch_source(src, work, name, at, cookies=None):
         # Only the few seconds around the frame we need, not the whole video.
         out = work / f"{name}-dl"
         auth = ["--cookies", str(Path(cookies).expanduser())] if cookies else []
-        run("yt-dlp", "-q", "--no-warnings", "--no-playlist", *auth, "-f", "bv*[height<=1080]/b",
-            "--download-sections", f"*{at}-{at + 2}", "-o", f"{out}.%(ext)s", src)
+        p = subprocess.run(
+            ["yt-dlp", "-q", "--no-warnings", "--no-playlist", *auth, "-f", "bv*[height<=1080]/b",
+             "--download-sections", f"*{at}-{at + 2}", "-o", f"{out}.%(ext)s", src],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+        )
         files = list(work.glob(f"{name}-dl.*"))
-        if len(files) != 1:
-            die(f"yt-dlp produced {len(files)} files for {src}")
+        if p.returncode != 0 or len(files) != 1:
+            reason = p.stderr.strip().splitlines()[-1] if p.stderr.strip() else f"{len(files)} files written"
+            die(
+                f"could not download --{name} {src}\n  yt-dlp: {reason}\n"
+                "  Fix: download the video yourself (browser or `yt-dlp <url>`) and pass the file path,\n"
+                "  or export YouTube cookies to cookies.txt and add --cookies cookies.txt."
+            )
         return files[0], 0
     path = Path(src).expanduser()
     if not path.exists():
