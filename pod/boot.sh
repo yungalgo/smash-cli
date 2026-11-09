@@ -52,20 +52,17 @@ pip install -q --no-cache-dir -r ComfyUI/custom_nodes/ComfyUI-KJNodes/requiremen
 pip install -q --no-cache-dir "huggingface_hub[hf_xet]>=0.34"
 
 # Official ComfyUI repackage of MiniMax H3; folder layout matches ComfyUI/models.
+# Kent's example selects the pruned INT8 model and INT8 video VAE; the full INT8
+# model and fp16 VAE are the higher-precision options (`--model full`, `--vae fp16`).
 hf download Comfy-Org/MiniMax-H3 \
   diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors \
+  diffusion_models/minimax_h3_fl2va_int8_convrot.safetensors \
   loras/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors \
   text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors \
   vae/minimax_h3_video_vae_int8_convrot.safetensors \
+  vae/minimax_h3_video_vae_fp16.safetensors \
   vae/minimax_h3_audio_vae_fp32.safetensors \
   --local-dir ComfyUI/models
-
-# Omni video blend (`smash-cli blend`): the NVFP4 ref2va model Kent's example
-# selects (derived from the Comfy-Org repackage) and its 8-step turbo LoRA.
-hf download FenomAI/MiniMax-H3 minimax_h3_ref2va_pruned_nvfp4.safetensors \
-  --local-dir ComfyUI/models/diffusion_models
-hf download lightx2v/Minimax-h3-Turbo minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors \
-  --local-dir ComfyUI/models/loras
 
 cd ComfyUI
 exec python3 main.py --listen 0.0.0.0 --port 8188
