@@ -43,6 +43,7 @@ What we found in tests (same inputs and seed, 768²):
 - `--guider regional` is clean and about 3× faster, but the regions stay more separate. With moving presets, it settles on one source.
 - FlashVSR reduces the grain a little in 1:1 crops, but at normal viewing size the difference is small. SeedVR is sharper but keeps the grain lines.
 - Mix inputs: put one texture together with motion subjects (people, animals, crowds). Three texture images or presets with large black bands give weak results, because the canvas then dominates.
+- The canvas often dominates at Kent's default strength 0.65. `--canvas-strength 0.3` lets the regions show more. Similar scenes (for example a surfer and horses in water) tend to merge into one.
 
 ## Setup
 
