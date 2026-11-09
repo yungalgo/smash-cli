@@ -1,0 +1,6 @@
+.env
+.venv/
+__pycache__/
+*.mp4
+!vendor/kentskooking/*.mp4
+uv.lock
